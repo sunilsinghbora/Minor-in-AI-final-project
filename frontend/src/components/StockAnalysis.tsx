@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Plot from 'react-plotly.js';
+import axios from 'axios';
 
 interface StockAnalysisProps {
   ticker: string;
@@ -20,92 +21,235 @@ const TIME_RANGES = [
 ];
 
 const ML_MODELS = [
-  { label: 'RNN (Recurrent Neural Network)', value: 'rnn' },
   { label: 'LSTM (Long Short-Term Memory)', value: 'lstm' },
-  { label: 'GRU (Gated Recurrent Unit)', value: 'gru' },
-  { label: 'CNN (Convolutional Neural Network)', value: 'cnn' },
-  { label: 'TFT (Temporal Fusion Transformer)', value: 'tft' }
+  { label: 'GRU (Gated Recurrent Unit)', value: 'gru' }
 ];
 
-// Mock data generator for demonstration
-const generateMockData = (days: number) => {
-  const data = [];
-  const startPrice = 150 + Math.random() * 50;
-  let currentPrice = startPrice;
-  
-  for (let i = 0; i < days; i++) {
-    const date = new Date();
-    date.setDate(date.getDate() - (days - i));
-    
-    currentPrice += (Math.random() - 0.5) * 10;
-    currentPrice = Math.max(currentPrice, 10); // Minimum price
-    
-    data.push({
-      date: date.toISOString().split('T')[0],
-      price: currentPrice
-    });
-  }
-  
-  return data;
-};
+// Expert Mode: We now expose two controls instead of pre-defined profiles:
+// - History range dropdown
+// - Epochs dropdown
+
+// (removed) mock data generator; now using backend API
+
+// Use relative base by default so CRA proxy works (especially in Codespaces/containers)
+const API_BASE = (process.env.REACT_APP_API_BASE as string) || '';
 
 const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   const [selectedTimeRange, setSelectedTimeRange] = useState('1m');
   const [selectedModel, setSelectedModel] = useState('lstm');
+  // Expert Mode selections
+  const [historyRange, setHistoryRange] = useState('1y');
+  const [epochChoice, setEpochChoice] = useState<number>(8);
+  const [dropout, setDropout] = useState<number>(0.3);
+  const [windowLen, setWindowLen] = useState<number>(60);
   const [isModelRunning, setIsModelRunning] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [progressEpoch, setProgressEpoch] = useState<number>(0);
+  const [progressTotal, setProgressTotal] = useState<number>(0);
+  // removed progressKey local state (key is kept in closure during a run)
+  const [progressStatus, setProgressStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const progressTimerRef = useRef<any>(null);
   const [showPrediction, setShowPrediction] = useState(false);
-  const [devMode, setDevMode] = useState(false);
+  const [expertMode, setExpertMode] = useState(false);
   const [stockData, setStockData] = useState<any[]>([]);
+  const [companyName, setCompanyName] = useState<string>('');
   const [predictionData, setPredictionData] = useState<any[]>([]);
-  const [sentimentScore] = useState(75); // Mock sentiment score
+  const [fittedData, setFittedData] = useState<Array<{ date: string; price: number }>>([]);
+  const [testBoundaryIndex, setTestBoundaryIndex] = useState<number | null>(null);
+  const [testBoundaryDate, setTestBoundaryDate] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<any | null>(null);
+  const [usedConfig, setUsedConfig] = useState<any | null>(null);
+  const [forecastHorizon, setForecastHorizon] = useState<number>(5);
+  const [sentimentScore, setSentimentScore] = useState<number>(0);
+  const [loadingData, setLoadingData] = useState<boolean>(false);
+  const [loadingSentiment, setLoadingSentiment] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  // Whether to clip prediction (fitted) traces to the selected visible range
+  const [clipPredToRange, setClipPredToRange] = useState<boolean>(true);
+  // Fit line now always shows across full history; no scope toggle
+  // Warm-up removed
+  const [backendHealthy, setBackendHealthy] = useState<boolean | null>(null);
+  const [showRetryButton, setShowRetryButton] = useState(false);
+  const retryRef = useRef(0);
+  const pingBackend = async () => {
+    try {
+      setBackendHealthy(null);
+      const res = await axios.get(`${API_BASE}/api/health`, { timeout: 4000 });
+      setBackendHealthy(Boolean(res.data?.status === 'healthy'));
+    } catch {
+      setBackendHealthy(false);
+    }
+  };
+
+  const reloadStockData = async () => {
+    setLoadingData(true);
+    setError(null);
+    try {
+      const res = await axios.get(`${API_BASE}/api/stock/${encodeURIComponent(ticker)}/data`, {
+        params: { range: selectedTimeRange }
+      });
+      const arr = res.data?.data || [];
+      setStockData(arr);
+      if (!arr.length) setError('No data returned. Try a different range or ticker.');
+      setCompanyName(res.data?.companyName || ticker);
+    } catch (e) {
+      setError('Failed to load stock data. Backend may be unreachable.');
+    } finally {
+      setLoadingData(false);
+    }
+  };
 
   useEffect(() => {
-    // Generate mock data based on time range
-    const daysMap: Record<string, number> = {
-      '5d': 5, '1w': 7, '1m': 30, '3m': 90, '6m': 180,
-      '1y': 365, '2y': 730, '3y': 1095, '5y': 1825, 'max': 2555
+    let cancelled = false;
+    const load = async () => {
+      setLoadingData(true);
+      setError(null);
+      try {
+  const res = await axios.get(`${API_BASE}/api/stock/${encodeURIComponent(ticker)}/data`, {
+          params: { range: selectedTimeRange }
+        });
+        if (cancelled) return;
+  const arr = res.data?.data || [];
+  setStockData(arr);
+  if (!arr.length) setError('No data returned. Try a different range or ticker.');
+        setCompanyName(res.data?.companyName || ticker);
+      } catch (e: any) {
+  if (!cancelled) setError('Failed to load stock data. Backend may be unreachable.');
+      } finally {
+        if (!cancelled) setLoadingData(false);
+      }
     };
-    
-    const data = generateMockData(daysMap[selectedTimeRange] || 30);
-    setStockData(data);
+    load();
+    return () => { cancelled = true; };
   }, [selectedTimeRange, ticker]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setLoadingSentiment(true);
+      try {
+        const res = await axios.get(`${API_BASE}/api/stock/${encodeURIComponent(ticker)}/sentiment`);
+        if (cancelled) return;
+        setSentimentScore(res.data?.score ?? 50);
+      } catch (e) {
+        if (!cancelled) setSentimentScore(50);
+      } finally {
+        if (!cancelled) setLoadingSentiment(false);
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [ticker]);
+
+  // Warm-up removed
+
+  // Backend health check banner
+  useEffect(() => {
+    let cancelled = false;
+    let timer: any;
+    const ping = async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/api/health`, { timeout: 4000 });
+        const ok = Boolean(res.data?.status === 'healthy');
+        if (cancelled) return;
+        setBackendHealthy(ok);
+        if (ok) {
+          retryRef.current = 0;
+          setShowRetryButton(false);
+          // If we don't have data yet, reload it now that backend is up
+          if (!stockData.length && !loadingData) {
+            reloadStockData();
+          }
+        }
+      } catch {
+        if (cancelled) return;
+        setBackendHealthy(false);
+        if (retryRef.current < 3) {
+          retryRef.current += 1;
+          timer = setTimeout(ping, 2000);
+          return;
+        } else {
+          setShowRetryButton(true);
+        }
+      } finally {
+        if (!cancelled && !timer) timer = setTimeout(ping, 10000);
+      }
+    };
+    ping();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, []);
 
   const handleRunModel = async () => {
     setIsModelRunning(true);
     setProgress(0);
+    setProgressStatus('running');
+    // create a unique progress key so backend can report epoch progress
+  const key = `p-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     setShowPrediction(false);
-
-    // Simulate model training progress
-    const progressInterval = setInterval(() => {
-      setProgress(prev => {
-        if (prev >= 100) {
-          clearInterval(progressInterval);
-          setIsModelRunning(false);
-          setShowPrediction(true);
-          
-          // Generate prediction data (next 3 months)
-          const lastPrice = stockData[stockData.length - 1]?.price || 150;
-          const predictions = [];
-          let currentPrice = lastPrice;
-          
-          for (let i = 1; i <= 90; i++) { // 3 months
-            const date = new Date();
-            date.setDate(date.getDate() + i);
-            currentPrice += (Math.random() - 0.45) * 8; // Slight upward trend
-            
-            predictions.push({
-              date: date.toISOString().split('T')[0],
-              price: currentPrice
-            });
-          }
-          setPredictionData(predictions);
-          
-          return 100;
+    setMetrics(null);
+  setFittedData([]);
+    // Start polling backend for real training progress
+    if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+    progressTimerRef.current = setInterval(async () => {
+      if (!key) return;
+      try {
+        const r = await axios.get(`${API_BASE}/api/progress/${encodeURIComponent(key)}`);
+        const info = r.data || {};
+        if (typeof info.percent === 'number') setProgress(Math.max(0, Math.min(100, Math.round(info.percent))));
+  if (typeof info.current === 'number') setProgressEpoch(Number(info.current));
+  if (typeof info.total === 'number') setProgressTotal(Number(info.total));
+        if (info.status === 'done') {
+          setProgressStatus('done');
+          clearInterval(progressTimerRef.current);
+          progressTimerRef.current = null;
+        } else if (info.status === 'error') {
+          setProgressStatus('error');
+          clearInterval(progressTimerRef.current);
+          progressTimerRef.current = null;
+        } else {
+          setProgressStatus('running');
         }
-        return prev + Math.random() * 15 + 5;
+      } catch {
+        // ignore transient errors; keep polling briefly
+      }
+    }, 800);
+    try {
+      // If expert mode is off, force max range and 20 epochs; else use selected history/epoch
+  const cfg = expertMode ? { train_range: historyRange, epochs: epochChoice, window: windowLen } : { train_range: 'max', epochs: 20, window: 60 };
+  const res = await axios.post(`${API_BASE}/api/stock/${encodeURIComponent(ticker)}/predict`, {
+        model: selectedModel,
+        train_range: cfg.train_range,
+        epochs: cfg.epochs,
+        horizon: forecastHorizon,
+        expertMode: expertMode,
+        dropout: expertMode ? dropout : undefined,
+  window: cfg.window,
+        progress_key: key
       });
-    }, 200);
+  const preds = (res.data?.predictions || []) as Array<{ date: string; price: number }>;
+      setPredictionData(preds);
+  setFittedData((res.data?.fitted || []) as Array<{ date: string; price: number }>);
+  // Capture backend-provided test boundary index for coloring fitted series
+  const tBoundary = res.data?.test_boundary?.index;
+  if (typeof tBoundary === 'number' && tBoundary >= 0) setTestBoundaryIndex(Number(tBoundary)); else setTestBoundaryIndex(null);
+  const tBoundaryDate = res.data?.test_boundary?.date;
+  setTestBoundaryDate(typeof tBoundaryDate === 'string' ? tBoundaryDate : null);
+      setMetrics(res.data?.metrics || null);
+  setUsedConfig(res.data?.used || null);
+      setShowPrediction(true);
+  // Do not change the user's selected time range after prediction
+      setProgress(100);
+      setProgressStatus('done');
+    } catch (e: any) {
+      setShowPrediction(false);
+      setProgressStatus('error');
+      const msg = e?.response?.data?.error || 'Prediction failed. Please try a different range or later.';
+      setError(msg);
+  setFittedData([]);
+    } finally {
+      if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
+      setIsModelRunning(false);
+    }
   };
 
   const CircularProgress: React.FC<{ score: number; label: string; color: string }> = 
@@ -151,19 +295,44 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
     <div className="analysis-container">
       {/* Header */}
       <div className="analysis-header">
-        <div className="header-left">
+  <div className="header-left">
           <button onClick={onBack} className="back-button">
             ← Back
           </button>
-          <h1 className="analysis-title">{ticker} Analysis</h1>
+          <h1 className="analysis-title">{ticker} {companyName ? `• ${companyName}` : ''} Analysis</h1>
         </div>
-        <button
-          onClick={() => setDevMode(!devMode)}
-          className="dev-mode-button"
-        >
-          Dev Mode {devMode ? 'ON' : 'OFF'}
-        </button>
+  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+    <span style={{ color: '#ddd', fontSize: 14 }}>Expert Mode</span>
+          <div
+            onClick={() => setExpertMode(!expertMode)}
+            role="switch"
+            aria-checked={expertMode}
+            style={{ cursor: 'pointer', width: 80, height: 32, borderRadius: 16, background: expertMode ? '#00c853' : '#555', display: 'flex', alignItems: 'center', padding: 4, boxShadow: 'inset 0 0 4px rgba(0,0,0,0.4)' }}
+            title={`Expert Mode ${expertMode ? 'ON' : 'OFF'}`}
+          >
+            <div style={{ width: 24, height: 24, borderRadius: '50%', background: '#fff', transform: expertMode ? 'translateX(48px)' : 'translateX(0px)', transition: 'transform 0.2s ease' }} />
+          </div>
+        </div>
       </div>
+
+      {(backendHealthy === false) && (
+        <div className="error-message" style={{ marginBottom: '1rem', background: '#552', border: '1px solid #a00', padding: '8px 12px', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <span>
+            Backend is unreachable. Ensure the server is running on port 5000.
+            {!showRetryButton && (
+              <span style={{ marginLeft: 10, color: '#ddd' }}>Auto-retrying ({retryRef.current}/3)…</span>
+            )}
+          </span>
+          {showRetryButton && (
+            <button onClick={() => { pingBackend(); reloadStockData(); }} style={{ background: '#a00', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 4, cursor: 'pointer' }}>
+              Retry
+            </button>
+          )}
+        </div>
+      )}
+      {error && (
+        <div className="error-message" style={{ marginBottom: '1rem' }}>{error}</div>
+      )}
 
       {/* Time Range Selector */}
       <div className="time-range-selector">
@@ -178,41 +347,87 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
             </button>
           ))}
         </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input
+            id="clipPredToRange"
+            type="checkbox"
+            checked={clipPredToRange}
+            onChange={(e) => setClipPredToRange(e.target.checked)}
+            style={{ cursor: 'pointer' }}
+          />
+          <label htmlFor="clipPredToRange" style={{ color: '#ddd', cursor: 'pointer' }}>
+            Clip predictions to selected range
+          </label>
+        </div>
       </div>
 
       {/* Stock Price Chart */}
       <div className="chart-container">
         <h2 className="chart-title">Price Chart</h2>
         <Plot
-          data={[
-            {
-              x: stockData.map(d => d.date),
-              y: stockData.map(d => d.price),
-              type: 'scatter' as const,
-              mode: 'lines' as const,
-              name: 'Historical Price',
-              line: { color: '#00ff00', width: 2 }
-            },
-            ...(showPrediction ? [{
-              x: predictionData.map(d => d.date),
-              y: predictionData.map(d => d.price),
-              type: 'scatter' as const,
-              mode: 'lines' as const,
-              name: 'Predicted Price',
-              line: { color: '#ff8000', width: 2, dash: 'dash' as const }
-            }] : [])
-          ]}
-          layout={{
+          data={(() => {
+            const historyColor = '#ffffff';
+            const trainFitColor = '#ff8000';
+            const testFitColor = '#00c853';
+            const futureColor = '#00c853';
+            // Ensure actual series always derives from loaded stockData
+            const xs = (stockData || []).map((d: any) => d?.date).filter(Boolean);
+            const ys = (stockData || []).map((d: any) => d?.price).filter((v: any) => v !== null && v !== undefined);
+            const series: any[] = [];
+            // Always show the actual historical data as a single white line
+            if (xs.length && ys.length && xs.length === ys.length) {
+              series.push({ x: xs, y: ys, type: 'scatter' as const, mode: 'lines' as const, name: 'Actual', line: { color: historyColor, width: 2 } });
+            }
+            // Show fitted line; optionally clip to the currently visible range, then split into train (orange) and test (green)
+            if (showPrediction && fittedData.length) {
+              // Clip fitted predictions to date boundaries of the visible history instead of exact date matches,
+              // so we still show daily fitted values when the history is weekly/monthly aggregated.
+              let base = fittedData;
+              if (clipPredToRange && xs.length) {
+                const xMin = xs[0];
+                const xMax = xs[xs.length - 1];
+                base = fittedData.filter(d => d.date >= xMin && d.date <= xMax);
+              }
+              if (base.length) {
+                // Prefer splitting by boundary date from backend; fallback to approximate index
+                let splitPos = Math.floor(base.length * 0.95);
+                if (testBoundaryDate) {
+                  const idx = base.findIndex(d => d.date >= testBoundaryDate);
+                  if (idx >= 0) splitPos = idx;
+                } else if (typeof testBoundaryIndex === 'number' && testBoundaryIndex >= 0) {
+                  splitPos = Math.max(0, Math.min(testBoundaryIndex, base.length));
+                }
+                const trainSeg = base.slice(0, Math.max(0, Math.min(splitPos, base.length)));
+                const testSeg = base.slice(Math.max(0, Math.min(splitPos, base.length)));
+                if (trainSeg.length) {
+                  series.push({ x: trainSeg.map(d => d.date), y: trainSeg.map(d => d.price), type: 'scatter' as const, mode: 'lines' as const, name: 'Prediction (train)', line: { color: trainFitColor, width: 2 } });
+                }
+                if (testSeg.length) {
+                  series.push({ x: testSeg.map(d => d.date), y: testSeg.map(d => d.price), type: 'scatter' as const, mode: 'lines' as const, name: 'Prediction (test)', line: { color: testFitColor, width: 2 } });
+                }
+              }
+            }
+            // Future forecast (dotted green)
+            if (showPrediction && predictionData.length) {
+              const px = predictionData.map(d => d.date);
+              const py = predictionData.map(d => d.price);
+              if (px.length && py.length) {
+                series.push({ x: px, y: py, type: 'scatter' as const, mode: 'lines' as const, name: 'Prediction (future)', line: { color: futureColor, width: 2, dash: 'dot' as const } });
+              }
+            }
+            return series;
+          })()}
+      layout={{
             paper_bgcolor: 'transparent',
             plot_bgcolor: 'transparent',
             font: { color: '#ffffff' },
             xaxis: { 
               gridcolor: '#333333',
-              title: 'Date'
+        title: { text: 'Date' }
             },
             yaxis: { 
               gridcolor: '#333333',
-              title: 'Price ($)'
+        title: { text: 'Price ($)' }
             },
             legend: {
               x: 0,
@@ -223,6 +438,9 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
           style={{ width: '100%', height: '400px' }}
           config={{ displayModeBar: false }}
         />
+        {loadingData && (
+          <div style={{ marginTop: '0.5rem', color: '#aaa' }}>Loading data…</div>
+        )}
       </div>
 
       {/* Model Selection and Controls */}
@@ -242,6 +460,68 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
               </option>
             ))}
           </select>
+
+          {expertMode && (
+            <>
+              <h3 className="control-title" style={{ marginTop: '1rem' }}>Training Data Range</h3>
+              <select
+                value={historyRange}
+                onChange={(e) => setHistoryRange(e.target.value)}
+                className="model-select"
+                disabled={isModelRunning}
+              >
+                <option value="5y">5 Years</option>
+                <option value="10y">10 Years</option>
+                <option value="15y">15 Years</option>
+                <option value="20y">20 Years</option>
+                <option value="max">Entire History</option>
+              </select>
+              <h3 className="control-title" style={{ marginTop: '1rem' }}>Epochs</h3>
+              <select
+                value={epochChoice}
+                onChange={(e) => setEpochChoice(parseInt(e.target.value, 10))}
+                className="model-select"
+                disabled={isModelRunning}
+              >
+                {[2,4,6,8,10,12,15,20,25,30,35,40,45,50].map(v => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+              <h3 className="control-title" style={{ marginTop: '1rem' }}>Forecast Horizon (days)</h3>
+              <select
+                value={forecastHorizon}
+                onChange={(e) => setForecastHorizon(parseInt(e.target.value, 10))}
+                className="model-select"
+                disabled={isModelRunning}
+              >
+                {[1,5,10,20,30,60,90].map(v => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+              <h3 className="control-title" style={{ marginTop: '1rem' }}>Window (days)</h3>
+              <select
+                value={windowLen}
+                onChange={(e) => setWindowLen(parseInt(e.target.value, 10))}
+                className="model-select"
+                disabled={isModelRunning}
+              >
+                {[20,30,40,50,60,75,90,120].map(v => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+              <h3 className="control-title" style={{ marginTop: '1rem' }}>Dropout</h3>
+              <select
+                value={dropout}
+                onChange={(e) => setDropout(parseFloat(e.target.value))}
+                className="model-select"
+                disabled={isModelRunning}
+              >
+                {[0,0.1,0.2,0.3,0.4,0.5].map(v => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </>
+          )}
           
           <button
             onClick={handleRunModel}
@@ -251,12 +531,18 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
             {isModelRunning ? 'Running Model...' : 'Run Model'}
           </button>
 
+          {!expertMode && (
+            <div style={{ marginTop: '0.5rem', color: '#bbb', fontSize: '0.9rem' }}>
+              Using all available history with ~95% train / 5% test (window=60, epochs=20, batch=32). Forecasts default to the next 5 trading days.
+            </div>
+          )}
+
           {/* Progress Circle */}
-          {isModelRunning && (
+      {isModelRunning && (
             <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'center' }}>
               <CircularProgress 
-                score={progress} 
-                label={`${Math.round(progress)}%`}
+  score={progress}
+  label={progressStatus === 'running' ? `${progressEpoch}/${progressTotal}` : progressStatus === 'done' ? 'Done' : progressStatus === 'error' ? 'Error' : `${Math.round(progress)}%`}
                 color="#00ff00"
               />
             </div>
@@ -269,43 +555,79 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
           <div style={{ display: 'flex', justifyContent: 'center' }}>
             <CircularProgress
               score={sentimentScore}
-              label="Sentiment Score"
+              label={loadingSentiment ? 'Loading…' : 'Sentiment Score'}
               color={sentimentScore >= 50 ? '#00ff00' : '#ff0000'}
             />
           </div>
           <p className="sentiment-description">
-            Based on news analysis from the last 3 months
+            Based on Yahoo Finance and Google News headlines (recent)
           </p>
         </div>
 
         {/* Model Performance (Dev Mode) */}
-        {devMode && (
-          <div className="control-panel">
+  {expertMode && (
+              <div className="control-panel">
             <h3 className="control-title">Model Metrics</h3>
             <div className="metrics-list">
               <div className="metric-row">
                 <span>RMSE:</span>
-                <span>2.34</span>
+                <span>{metrics?.rmse ?? '—'}</span>
               </div>
               <div className="metric-row">
                 <span>MAE:</span>
-                <span>1.87</span>
+                <span>{metrics?.mae ?? '—'}</span>
               </div>
               <div className="metric-row">
                 <span>R²:</span>
-                <span>0.89</span>
+                <span>{metrics?.r2 ?? '—'}</span>
               </div>
               <div className="metric-row">
                 <span>Training Acc:</span>
-                <span>94.2%</span>
+                <span>—</span>
               </div>
               <div className="metric-row">
                 <span>Val Acc:</span>
-                <span>91.8%</span>
+                <span>—</span>
               </div>
               <div className="metric-row">
                 <span>Epochs:</span>
-                <span>50</span>
+                <span>{metrics?.epochs ?? '—'}</span>
+              </div>
+            </div>
+          </div>
+        )}
+        {/* Used Config Panel */}
+        {showPrediction && (
+          <div className="control-panel">
+            <h3 className="control-title">Used Config</h3>
+            <div className="metrics-list">
+              <div className="metric-row">
+                <span>Window:</span>
+                <span>{usedConfig?.window ?? '—'}</span>
+              </div>
+              <div className="metric-row">
+                <span>Batch size:</span>
+                <span>{usedConfig?.batch_size ?? '—'}</span>
+              </div>
+              <div className="metric-row">
+                <span>Dropout:</span>
+                <span>{usedConfig?.dropout ?? '—'}</span>
+              </div>
+              <div className="metric-row">
+                <span>Horizon:</span>
+                <span>{usedConfig?.horizon ?? forecastHorizon}</span>
+              </div>
+              <div className="metric-row">
+                <span>Train range:</span>
+                <span>{usedConfig?.train_range ?? (expertMode ? historyRange : 'max')}</span>
+              </div>
+              <div className="metric-row">
+                <span>Features:</span>
+                <span>{usedConfig?.features ?? '—'}</span>
+              </div>
+              <div className="metric-row">
+                <span>Test split:</span>
+                <span>{usedConfig?.test_split ?? '—'}</span>
               </div>
             </div>
           </div>
@@ -315,25 +637,25 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
       {/* Prediction Results */}
       {showPrediction && (
         <div className="prediction-results">
-          <h3 className="control-title">Prediction Results (Next 3 Months)</h3>
+      <h3 className="control-title">Prediction Results (Next {forecastHorizon} Days)</h3>
           <div className="prediction-grid">
             <div>
               <div className="prediction-value">
-                ${predictionData[29]?.price?.toFixed(2) || 'N/A'}
+                ${predictionData[Math.min(0, predictionData.length - 1)]?.price?.toFixed(2) || 'N/A'}
               </div>
-              <div className="prediction-label">1 Month Target</div>
+              <div className="prediction-label">Next Day</div>
             </div>
             <div>
               <div className="prediction-value">
-                ${predictionData[59]?.price?.toFixed(2) || 'N/A'}
+                ${predictionData[Math.min(4, predictionData.length - 1)]?.price?.toFixed(2) || 'N/A'}
               </div>
-              <div className="prediction-label">2 Month Target</div>
+              <div className="prediction-label">1 Week</div>
             </div>
             <div>
               <div className="prediction-value">
-                ${predictionData[89]?.price?.toFixed(2) || 'N/A'}
+                ${predictionData[Math.min(forecastHorizon - 1, predictionData.length - 1)]?.price?.toFixed(2) || 'N/A'}
               </div>
-              <div className="prediction-label">3 Month Target</div>
+              <div className="prediction-label">Horizon End</div>
             </div>
           </div>
         </div>
