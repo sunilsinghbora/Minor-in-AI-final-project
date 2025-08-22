@@ -40,7 +40,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   // Expert Mode selections
   const [historyRange, setHistoryRange] = useState('1y');
   const [epochChoice, setEpochChoice] = useState<number>(8);
-  const [dropout, setDropout] = useState<number>(0.3);
+  const [dropout, setDropout] = useState<number>(0.5);
   const [windowLen, setWindowLen] = useState<number>(60);
   const [isModelRunning, setIsModelRunning] = useState(false);
   const [progress, setProgress] = useState(0);

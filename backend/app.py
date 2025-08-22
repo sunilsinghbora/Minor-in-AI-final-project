@@ -405,8 +405,8 @@ def predict_stock(ticker):
         epochs = 20
     # Batch size: default 32 in both modes unless overridden
     batch_size = int(data.get('batch_size', 32))
-    # Dropout: default 0.3 in Normal mode; Expert Mode can specify
-    default_dropout = 0.3 if not expert_mode else 0.0
+    # Dropout: default 0.5; Expert Mode can override via request body
+    default_dropout = 0.5
     dropout = float(data.get('dropout', default_dropout))
     # Forecast horizon in trading days (default 5)
     horizon = int(data.get('horizon', 5))
