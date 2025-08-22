@@ -27,6 +27,11 @@ function App() {
           onBack={handleBackToSearch}
         />
       )}
+      {/* Subtle bottom-right watermark (non-intrusive) */}
+      <div className="corner-watermark" aria-hidden="true">
+        <div>IIT Ropar, Minor In AI</div>
+        <div>Project submission by Sunil Singh Bora</div>
+      </div>
     </div>
   );
 }

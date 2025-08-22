@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
 interface TickerSearchProps {
+  // Parent supplies a callback to open the analysis screen for a symbol
   onTickerSelect: (ticker: string) => void;
 }
 
@@ -32,6 +33,7 @@ const TickerSearch: React.FC<TickerSearchProps> = ({ onTickerSelect }) => {
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Debounced autocomplete query; falls back to local list on error
     let cancelled = false;
     const q = inputValue.trim();
     if (!q) {
@@ -72,6 +74,7 @@ const TickerSearch: React.FC<TickerSearchProps> = ({ onTickerSelect }) => {
   };
 
   const openPreview = async (ticker: string) => {
+    // Open modal and load preview table (max history) for quick validation
     setPreviewTicker(ticker);
     setPreviewOpen(true);
     setPreviewLoading(true);
@@ -99,6 +102,7 @@ const TickerSearch: React.FC<TickerSearchProps> = ({ onTickerSelect }) => {
   };
 
   const handleAnalyzeClick = () => {
+    // Open preview for the typed ticker or suggestion
     const t = inputValue.trim();
     if (!t) return;
     const match = suggestions.find(s => s.symbol.toUpperCase() === t.toUpperCase());

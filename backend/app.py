@@ -42,7 +42,10 @@ TICKER_SYMBOLS = [
 # Mock data removed: backend now returns explicit errors when data fetch or training fails
 
 def calculate_sentiment_score(ticker):
-    """Deprecated: Calculate mock sentiment score based on ticker (kept for fallback)"""
+    """Deprecated mock sentiment score used as RSS fallback.
+
+    Called by: get_sentiment when RSS fetch fails.
+    """
     hash_value = sum(ord(c) for c in ticker)
     sentiment = 30 + (hash_value % 40)
     return sentiment
@@ -52,7 +55,10 @@ def calculate_sentiment_score(ticker):
 # ----------------------
 
 def _yahoo_time_params(time_range: str):
-    """Map UI time range to Yahoo Finance chart API range and interval."""
+    """Map UI time range to Yahoo Finance chart API range and interval.
+
+    Called by: fetch_yahoo_chart_data.
+    """
     mapping = {
         '5d': ('5d', '1h'),
         '1w': ('7d', '1h'),
@@ -188,23 +194,18 @@ def fetch_yahoo_history_csv(ticker: str, time_range: str = '1y'):
     return out, r.content
 
 def fetch_yahoo_close_series(ticker: str, range_code: str = '1y'):
-    """Fetch daily open and close prices (adjclose preferred for close) for model training.
-    range_code examples: '6mo', '1y', '2y', '5y'.
+    """Fetch open and close prices using Yahoo chart API with explicit period window.
+    Uses period1/period2 and interval=1d to avoid implicit downsampling for long ranges.
     """
-    # Yahoo chart API supports up to '10y' and 'max'. For larger custom ranges, use 'max'.
-    rng_in = (range_code or '1y')
+    rng = (range_code or '1y')
     try:
-        if isinstance(rng_in, str) and rng_in.endswith('y'):
-            yrs = int(rng_in[:-1])
-            rng = 'max' if yrs > 10 else rng_in
-        else:
-            rng = rng_in
+        p1, p2 = _time_range_to_unix_window(rng)
     except Exception:
-        rng = '1y'
+        p1, p2 = _time_range_to_unix_window('1y')
     interval = '1d'
     url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(ticker)}"
-        f"?range={rng}&interval={interval}&includePrePost=false&events=div,splits"
+        f"?period1={p1}&period2={p2}&interval={interval}&includePrePost=false&events=div,splits"
     )
     resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
@@ -252,7 +253,10 @@ def _score_text(text: str) -> int:
     return max(0, min(100, score))
 
 def fetch_sentiment_from_rss(ticker: str):
-    """Fetch recent headlines from Yahoo Finance and Google News RSS and compute a simple sentiment score."""
+    """Fetch recent headlines via RSS and compute a simple sentiment score.
+
+    Called by: /api/stock/<ticker>/sentiment endpoint.
+    """
     feeds = []
     # Yahoo Finance RSS for ticker
     yf_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote_plus(ticker)}&region=US&lang=en-US"
@@ -298,7 +302,10 @@ def fetch_sentiment_from_rss(ticker: str):
 
 @app.route('/api/tickers/search', methods=['GET'])
 def search_tickers():
-    """Search for ticker symbols based on query using Yahoo Finance autocomplete."""
+    """Search tickers by query using Yahoo Finance endpoints (with fallbacks).
+
+    Called by: frontend ticker search box as the user types.
+    """
     query = request.args.get('q', '').strip()
     if not query:
         return jsonify([])
@@ -350,7 +357,10 @@ def search_tickers():
 
 @app.route('/api/stock/<ticker>/data', methods=['GET'])
 def get_stock_data(ticker):
-    """Get stock data for a specific ticker and time range from Yahoo Finance."""
+    """Return historical data (date/open/close) for the selected range.
+
+    Called by: frontend when the user changes the visible time range.
+    """
     ticker = ticker.upper()
     time_range = request.args.get('range', '1m')
     try:
@@ -385,8 +395,10 @@ def predict_stock(ticker):
         model_name = 'lstm'
     expert_mode = bool(data.get('expertMode', False))
     progress_key = data.get('progress_key')
-    # If expert mode: honor client-provided controls; else: use max data by default
-    train_range = data.get('train_range', 'max' if not expert_mode else '6mo')
+    # Optional data source selection: 'auto' (default), 'csv', or 'chart'
+    source_pref = (data.get('source') or 'auto').lower()
+    # If expert mode: honor client-provided controls; else: default to 10y history
+    train_range = data.get('train_range', '10y' if not expert_mode else '6mo')
     # Normalize range: any year value > 20 maps to 'max' (all available history)
     try:
         if isinstance(train_range, str) and train_range.endswith('y'):
@@ -395,14 +407,14 @@ def predict_stock(ticker):
                 train_range = 'max'
     except Exception:
         pass
-    # Honor client-provided epochs; if missing/invalid, default to 20
+    # Honor client-provided epochs; if missing/invalid, default to 30
     try:
         epochs_in = data.get('epochs', None)
-        epochs = int(epochs_in) if epochs_in is not None else 20
+        epochs = int(epochs_in) if epochs_in is not None else 30
         if epochs <= 0:
-            epochs = 20
+            epochs = 30
     except Exception:
-        epochs = 20
+        epochs = 30
     # Batch size: default 32 in both modes unless overridden
     batch_size = int(data.get('batch_size', 32))
     # Dropout: default 0.5; Expert Mode can override via request body
@@ -419,15 +431,34 @@ def predict_stock(ticker):
         window = 60
 
     try:
-        # 2) Fetch training data via CSV first; fall back to chart API on failure (e.g., 401)
-        try:
-            series, _csv_bytes = fetch_yahoo_history_csv(ticker, train_range)
-        except Exception as fetch_e:
-            app.logger.info(f"CSV fetch failed for {ticker} ({train_range}): {fetch_e}; trying chart API fallback")
+        # 2) Fetch training data according to source preference with retries for CSV
+        data_source = None
+        last_err = None
+        def _csv_attempts(max_tries: int = 2):
+            nonlocal last_err
+            for i in range(max_tries):
+                try:
+                    return fetch_yahoo_history_csv(ticker, train_range)
+                except Exception as e:
+                    last_err = e
+                    app.logger.info(f"CSV attempt {i+1}/{max_tries} failed for {ticker} ({train_range}): {e}")
+            raise last_err or RuntimeError('CSV attempts exhausted')
+
+        if source_pref == 'csv':
+            series, _csv_bytes = _csv_attempts(2)
+            data_source = 'csv'
+        elif source_pref == 'chart':
+            series = fetch_yahoo_close_series(ticker, range_code=train_range)
+            data_source = 'chart'
+        else:
+            # auto: try CSV (with retry), then fallback to chart
             try:
+                series, _csv_bytes = _csv_attempts(2)
+                data_source = 'csv'
+            except Exception as fetch_e:
+                app.logger.info(f"CSV fetch failed for {ticker} ({train_range}): {fetch_e}; trying chart API fallback")
                 series = fetch_yahoo_close_series(ticker, range_code=train_range)
-            except Exception as chart_e:
-                raise chart_e
+                data_source = 'chart'
         dates, opens, closes = zip(*series)
 
         # 3) Log resolved configuration for transparency/debugging
@@ -502,6 +533,7 @@ def predict_stock(ticker):
                 'percent': 100,
                 'updated_at': datetime.now().isoformat(),
             }
+
         # 8) Align fitted with dates: fitted corresponds to windows ending points (len = len(dates)-window)
         fitted_points = []
         test_boundary = None
@@ -526,7 +558,19 @@ def predict_stock(ticker):
             test_boundary = None
 
         # 9) Return API payload with predictions, fitted series, metrics and echo of used config
-        return jsonify({
+        # Derive a simple resolution hint (daily vs downsampled) by average spacing between points
+        resolution = 'daily'
+        try:
+            if len(dates) >= 2:
+                dt0 = datetime.strptime(dates[0], '%Y-%m-%d')
+                dt1 = datetime.strptime(dates[1], '%Y-%m-%d')
+                avg_days = abs((dt1 - dt0).days)
+                if avg_days >= 5:
+                    resolution = 'downsampled'
+        except Exception:
+            pass
+
+        payload = {
             'ticker': ticker,
             'model': model_name,
             'predictions': out,
@@ -542,10 +586,16 @@ def predict_stock(ticker):
                 'horizon': horizon,
                 'test_split': float(test_split),
                 'features': result.get('features', 'close'),
-                'scaler': metrics.get('scaler')
+                'scaler': metrics.get('scaler'),
+                # Transparency: how many points and windowed samples were used
+                'history_points': len(dates),
+                'samples': len(fitted_points) if fitted_points else max(0, len(dates) - window),
+                'data_source': data_source,
+                'resolution': resolution,
             },
             'progress_key': progress_key,
-        })
+        }
+        return jsonify(payload)
     except Exception as e:
         app.logger.warning(f"ML prediction failed for {ticker} ({model_name}): {e}")
         if progress_key:
@@ -626,7 +676,10 @@ def get_sentiment(ticker):
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint for liveness/readiness.
+
+    Called by: frontend ping to confirm backend is up.
+    """
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
 
 # Warm-up health endpoint removed

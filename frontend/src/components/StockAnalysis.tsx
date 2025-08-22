@@ -3,6 +3,7 @@ import Plot from 'react-plotly.js';
 import axios from 'axios';
 
 interface StockAnalysisProps {
+  // Passed by parent: ticker symbol selected and navigation back handler
   ticker: string;
   onBack: () => void;
 }
@@ -71,6 +72,15 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   const [backendHealthy, setBackendHealthy] = useState<boolean | null>(null);
   const [showRetryButton, setShowRetryButton] = useState(false);
   const retryRef = useRef(0);
+  // Logo handling: attempt a couple of public sources; hide if both fail
+  const upperTicker = ticker.toUpperCase();
+  const logoCandidates = [
+    `https://financialmodelingprep.com/image-stock/${upperTicker}.png`,
+    `https://eodhistoricaldata.com/img/logos/US/${upperTicker}.png`,
+  ];
+  const [logoIdx, setLogoIdx] = useState<number>(0);
+  const [showLogo, setShowLogo] = useState<boolean>(true);
+  useEffect(() => { setLogoIdx(0); setShowLogo(true); }, [upperTicker]);
   const pingBackend = async () => {
     try {
       setBackendHealthy(null);
@@ -82,6 +92,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   };
 
   const reloadStockData = async () => {
+    // Fetch price history for the currently selected time range
     setLoadingData(true);
     setError(null);
     try {
@@ -100,6 +111,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   };
 
   useEffect(() => {
+    // Load initial chart data and refresh when time range changes
     let cancelled = false;
     const load = async () => {
       setLoadingData(true);
@@ -124,6 +136,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   }, [selectedTimeRange, ticker]);
 
   useEffect(() => {
+    // Load sentiment score when ticker changes
     let cancelled = false;
     const load = async () => {
       setLoadingSentiment(true);
@@ -145,6 +158,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
 
   // Backend health check banner
   useEffect(() => {
+    // Periodically ping the backend; auto-retry a few times and show Retry button
     let cancelled = false;
     let timer: any;
     const ping = async () => {
@@ -180,6 +194,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
   }, []);
 
   const handleRunModel = async () => {
+    // Kick off training+forecast for the selected model and settings; poll progress until done
     setIsModelRunning(true);
     setProgress(0);
     setProgressStatus('running');
@@ -215,7 +230,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
     }, 800);
     try {
       // If expert mode is off, force max range and 20 epochs; else use selected history/epoch
-  const cfg = expertMode ? { train_range: historyRange, epochs: epochChoice, window: windowLen } : { train_range: 'max', epochs: 20, window: 60 };
+  const cfg = expertMode ? { train_range: historyRange, epochs: epochChoice, window: windowLen } : { train_range: '10y', epochs: 30, window: 60 };
   const res = await axios.post(`${API_BASE}/api/stock/${encodeURIComponent(ticker)}/predict`, {
         model: selectedModel,
         train_range: cfg.train_range,
@@ -296,6 +311,18 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
       {/* Header */}
       <div className="analysis-header">
   <div className="header-left">
+          {showLogo && (
+            <img
+              src={logoCandidates[Math.min(logoIdx, logoCandidates.length - 1)]}
+              alt={`${upperTicker} logo`}
+              width={32}
+              height={32}
+              style={{ borderRadius: 6, marginRight: 8, objectFit: 'contain', background: '#222' }}
+              onError={() => {
+                if (logoIdx + 1 < logoCandidates.length) setLogoIdx(logoIdx + 1); else setShowLogo(false);
+              }}
+            />
+          )}
           <button onClick={onBack} className="back-button">
             ← Back
           </button>
@@ -364,9 +391,10 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
       {/* Stock Price Chart */}
       <div className="chart-container">
         <h2 className="chart-title">Price Chart</h2>
-        <Plot
+    <Plot
           data={(() => {
-            const historyColor = '#ffffff';
+      const css = typeof document !== 'undefined' ? getComputedStyle(document.documentElement) : ({} as any);
+      const historyColor = (css.getPropertyValue?.('--fg') || '#ffffff').trim() || '#ffffff';
             const trainFitColor = '#ff8000';
             const testFitColor = '#00c853';
             const futureColor = '#00c853';
@@ -417,24 +445,27 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
             }
             return series;
           })()}
-      layout={{
-            paper_bgcolor: 'transparent',
-            plot_bgcolor: 'transparent',
-            font: { color: '#ffffff' },
-            xaxis: { 
-              gridcolor: '#333333',
-        title: { text: 'Date' }
-            },
-            yaxis: { 
-              gridcolor: '#333333',
-        title: { text: 'Price ($)' }
-            },
-            legend: {
-              x: 0,
-              y: 1
-            },
-            margin: { t: 40, l: 60, r: 40, b: 60 }
-          }}
+      layout={(() => {
+            const css = typeof document !== 'undefined' ? getComputedStyle(document.documentElement) : ({} as any);
+            const fg = (css.getPropertyValue?.('--fg') || '#ffffff').trim() || '#ffffff';
+            const panel = (css.getPropertyValue?.('--panel') || '#1a1a1a').trim() || '#1a1a1a';
+            const panelBorder = (css.getPropertyValue?.('--panel-border') || '#333333').trim() || '#333333';
+            return {
+              paper_bgcolor: panel,
+              plot_bgcolor: panel,
+              font: { color: fg },
+              xaxis: { 
+                gridcolor: panelBorder,
+                title: { text: 'Date', font: { color: fg } }
+              },
+              yaxis: { 
+                gridcolor: panelBorder,
+                title: { text: 'Price ($)', font: { color: fg } }
+              },
+              legend: { x: 0, y: 1, font: { color: fg } },
+              margin: { t: 40, l: 60, r: 40, b: 60 }
+            } as any;
+          })()}
           style={{ width: '100%', height: '400px' }}
           config={{ displayModeBar: false }}
         />
@@ -533,7 +564,7 @@ const StockAnalysis: React.FC<StockAnalysisProps> = ({ ticker, onBack }) => {
 
           {!expertMode && (
             <div style={{ marginTop: '0.5rem', color: '#bbb', fontSize: '0.9rem' }}>
-              Using all available history with ~95% train / 5% test (window=60, epochs=20, batch=32). Forecasts default to the next 5 trading days.
+              Using last 10 years with ~95% train / 5% test (window=60, epochs=30, dropout=0.5, batch=32). Forecasts default to the next 5 trading days.
             </div>
           )}
 

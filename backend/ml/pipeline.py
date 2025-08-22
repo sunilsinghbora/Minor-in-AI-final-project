@@ -16,6 +16,11 @@ HORIZON = 5
 
 
 class _BaseScaler:
+    """Minimal scaler interface used by this pipeline.
+
+    Called by: train_and_forecast to normalize features/targets.
+    Implementations: MinMaxScaler, StandardScaler.
+    """
     def fit(self, arr: np.ndarray):
         raise NotImplementedError
 
@@ -33,6 +38,10 @@ class _BaseScaler:
 
 
 class MinMaxScaler(_BaseScaler):
+    """Simple [0,1] scaler (NumPy-only), mostly kept for reference.
+
+    Called by: not used by default; StandardScaler is preferred.
+    """
     def __init__(self):
         self.min_: Optional[np.ndarray] = None
         self.max_: Optional[np.ndarray] = None
@@ -70,6 +79,7 @@ class StandardScaler(_BaseScaler):
 
     Exposes the same small interface used in this pipeline, including
     inverse_component(idx) for single-target inversion from a multi-feature scaler.
+    Called by: train_and_forecast to scale inputs and invert predictions.
     """
 
     def __init__(self):
@@ -125,6 +135,11 @@ class StandardScaler(_BaseScaler):
 
 
 def make_windows(series: np.ndarray, window: int = WINDOW) -> Tuple[np.ndarray, np.ndarray]:
+    """Create sliding windows for univariate time series.
+
+    What it does: X=(N-window, window, 1), y=(N-window,). Used when using close-only input.
+    Called by: train_and_forecast when use_multi is False.
+    """
     X, y = [], []
     for i in range(len(series) - window):
         X.append(series[i:i+window])
@@ -135,7 +150,10 @@ def make_windows(series: np.ndarray, window: int = WINDOW) -> Tuple[np.ndarray, 
 
 def make_windows_multi(features: np.ndarray, target: np.ndarray, window: int = WINDOW) -> Tuple[np.ndarray, np.ndarray]:
     """Create windows for multi-feature inputs with a 1D target series.
-    features: shape (N, F); target: shape (N,). Returns X:(N-window, window, F), y:(N-window,).
+
+    What it does: Given features (N,F) and target (N,), returns
+    X:(N-window, window, F), y:(N-window,). Keeps chronological order.
+    Called by: train_and_forecast when using open+close features.
     """
     X, y = [], []
     N = len(target)
@@ -153,9 +171,13 @@ def train_and_forecast(prices: Union[List[float], Dict[str, List[float]], List[T
                        dropout: float = 0.0,
                        batch_size: int = 32,
                        progress_callback: Optional[callable] = None) -> Dict:
-    """Train a small model on close prices and produce iterative forecasts.
+    """Train a small model and produce short-horizon forecasts.
 
-    Returns dict with: predictions (list), metrics (mocked minimal), window/horizon.
+    Inputs: prices as close list OR dict with {'open','close'}; hyperparams window/horizon/epochs.
+    What it does: scales data (StandardScaler), builds LSTM/GRU, fits with optional test split,
+    computes metrics on original scale, returns fitted series and future predictions.
+    Called by: Flask endpoint predict_stock in backend.app.
+    Returns: dict with predictions, fitted, metrics, window/horizon, etc.
     """
     # Normalize input into either 1D close-only array or 2D [open, close] features with close as target
     use_multi = False
@@ -218,7 +240,7 @@ def train_and_forecast(prices: Union[List[float], Dict[str, List[float]], List[T
         X, y = make_windows(scaled, window)
         input_shape = (window, 1)
 
-    builder = get_model_builder(model_name)
+    builder = get_model_builder(model_name)  # resolves to build_lstm or build_gru
     model = builder(input_shape, dropout=float(dropout))
     # Early stopping setup
     callbacks = []
@@ -252,7 +274,7 @@ def train_and_forecast(prices: Union[List[float], Dict[str, List[float]], List[T
         X_train, y_train = X[:split_idx], y[:split_idx]
         X_test, y_test = X[split_idx:], y[split_idx:]
 
-        # Compute naive baseline (predict last value in the window) for reporting only
+    # Compute naive baseline (predict last value in the window) for reporting only
         if use_multi:
             naive_pred = X_test[:, -1, target_idx]
         else:
@@ -277,7 +299,7 @@ def train_and_forecast(prices: Union[List[float], Dict[str, List[float]], List[T
             callbacks=callbacks
         )
 
-        # Test metrics on original scale
+    # Test metrics on original scale (inverse-transform)
         test_pred = model.predict(X_test, verbose=0).squeeze()
         if use_multi:
             y_test_inv = scaler.inverse_component(y_test, target_idx)
@@ -347,7 +369,7 @@ def train_and_forecast(prices: Union[List[float], Dict[str, List[float]], List[T
             callbacks=callbacks
         )
 
-    # iterative forecasting
+    # Iterative forecasting on scaled domain, then invert to price scale
     preds_scaled = []
     if use_multi:
         last_window = scaled_features[-window:, :].copy()
